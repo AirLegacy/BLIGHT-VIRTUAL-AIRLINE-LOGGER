@@ -10,15 +10,17 @@ from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, Request, Query, Form
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 import aiosqlite
+from jinja2 import Template
 
 # ------------------- CONFIG -------------------
 AIRLINE_PREFIX = os.getenv("AIRLINE_PREFIX", "BLY").upper()
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "45"))
 DATABASE = "flights.db"
 VATSIM_URL = "https://data.vatsim.net/v3/vatsim-data.json"
+DELETE_PASSWORD = "BLIGHTYVIRTUALAIRLINES"
 
 # ------------------- DATABASE -------------------
 def init_db():
@@ -212,20 +214,24 @@ HTML_PAGE = """
   </header>
 
   <main class="max-w-7xl mx-auto px-4 py-8 space-y-8">
-    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+    <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
       <div class="card rounded-xl p-5">
         <p class="text-slate-400 text-sm">Currently Online</p>
         <p class="text-3xl font-bold mt-1 mono accent">{{ online_count }}</p>
       </div>
       <div class="card rounded-xl p-5">
-        <p class="text-slate-400 text-sm">Completed Flights (90 days)</p>
+        <p class="text-slate-400 text-sm">Completed Flights (90d)</p>
         <p class="text-3xl font-bold mt-1 mono">{{ total_flights }}</p>
       </div>
       <div class="card rounded-xl p-5">
-        <p class="text-slate-400 text-sm">Unique Pilots (90 days)</p>
+        <p class="text-slate-400 text-sm">Unique Pilots (90d)</p>
         <p class="text-3xl font-bold mt-1 mono {% if unique_pilots >= 15 %}text-emerald-400{% else %}text-amber-400{% endif %}">
-          {{ unique_pilots }} <span class="text-sm font-normal text-slate-400">/ 15 needed</span>
+          {{ unique_pilots }} <span class="text-sm font-normal text-slate-400">/ 15</span>
         </p>
+      </div>
+      <div class="card rounded-xl p-5">
+        <p class="text-slate-400 text-sm">Total Flight Hours (90d)</p>
+        <p class="text-3xl font-bold mt-1 mono text-sky-300">{{ total_hours }}</p>
       </div>
     </div>
 
@@ -285,6 +291,7 @@ HTML_PAGE = """
                 <th class="px-4 py-3 font-medium">Logon (Z)</th>
                 <th class="px-4 py-3 font-medium">Logoff (Z)</th>
                 <th class="px-4 py-3 font-medium">Duration</th>
+                <th class="px-4 py-3 font-medium">Action</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-800">
@@ -298,6 +305,15 @@ HTML_PAGE = """
                 <td class="px-4 py-3 mono text-slate-300">{{ f.logoff_time[:19] if f.logoff_time else "—" }}Z</td>
                 <td class="px-4 py-3 mono">
                   {% if f.total_minutes %}{{ (f.total_minutes // 60) }}h {{ (f.total_minutes % 60) }}m{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-3">
+                  <form method="POST" action="/delete/{{ f.id }}" onsubmit="return confirm('Delete this flight?');" class="inline">
+                    <input type="hidden" name="password" id="pw-{{ f.id }}">
+                    <button type="button" onclick="askPassword({{ f.id }})"
+                            class="text-xs px-2 py-1 rounded bg-red-900/60 hover:bg-red-700 text-red-200 transition">
+                      Delete
+                    </button>
+                  </form>
                 </td>
               </tr>
               {% endfor %}
@@ -317,13 +333,21 @@ HTML_PAGE = """
       For VATSIM Partner audits: use the Export button above
     </footer>
   </main>
-  <script>setTimeout(() => location.reload(), 60000);</script>
+
+  <script>
+    setTimeout(() => location.reload(), 60000);
+
+    function askPassword(id) {
+      const pw = prompt("Enter delete password:");
+      if (pw === null) return;
+      document.getElementById("pw-" + id).value = pw;
+      document.querySelector(`form[action="/delete/${id}"]`).submit();
+    }
+  </script>
 </body>
 </html>
 """
 
-
-from jinja2 import Template
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
@@ -340,13 +364,19 @@ async def dashboard(request: Request):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
         stats = await db.execute_fetchall(
             """
-            SELECT COUNT(*) as total_flights, COUNT(DISTINCT cid) as unique_pilots
-            FROM flights WHERE logon_time >= ? AND status = 'completed'
+            SELECT 
+                COUNT(*) as total_flights, 
+                COUNT(DISTINCT cid) as unique_pilots,
+                COALESCE(SUM(total_minutes), 0) as total_minutes
+            FROM flights 
+            WHERE logon_time >= ? AND status = 'completed'
             """,
             (cutoff,),
         )
         total_flights = stats[0]["total_flights"] if stats else 0
         unique_pilots = stats[0]["unique_pilots"] if stats else 0
+        total_minutes = stats[0]["total_minutes"] if stats else 0
+        total_hours = round(total_minutes / 60, 1)
 
     template = Template(HTML_PAGE)
     html = template.render(
@@ -355,8 +385,21 @@ async def dashboard(request: Request):
         online_count=len(online),
         total_flights=total_flights,
         unique_pilots=unique_pilots,
+        total_hours=total_hours,
     )
     return HTMLResponse(html)
+
+
+@app.post("/delete/{flight_id}")
+async def delete_flight(flight_id: int, password: str = Form(...)):
+    if password != DELETE_PASSWORD:
+        return HTMLResponse("<h1>Wrong password</h1><a href='/'>Go back</a>", status_code=403)
+
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("DELETE FROM flights WHERE id = ?", (flight_id,))
+        await db.commit()
+
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.get("/export.csv")
